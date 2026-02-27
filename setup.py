@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="pinterest-downloader",
-    version="2.0.6",
+    version="3.0.0",
     author="Ahmed Nagm",
     description="Pinterest data extractor library",
     long_description=long_description,
