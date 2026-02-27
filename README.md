@@ -1,60 +1,126 @@
-# pinterest-downloader
+# pinterest-downloader v3
 
-This Python library allows you to search for images on Pinterest and download them asynchronously. It uses asynchronous programming to efficiently search
+Pinterest data extractor. No API key required. No dependencies.
 
-## Features
+## Install
 
-- Search Pinterest for images based on a query
-- Download images and videos from Pinterest
-- Asynchronous operations for improved performance
-- Supports both image and video content from Pinterest
-
-
-## Requirements
-
-- Python 3.7+
-- aiohttp
-
-
-## Installation
-
-You can install this package using pip:
-
-```shellscript
-pip3 install -U pinterest-downloader
+```bash
+pip install pinterest-downloader
 ```
 
-## Usage
-
-You can use this library in your Python projects by importing the necessary functions:
+## Quick Start
 
 ```python
-import asyncio
-from pinterest_downloader import *
+from pinterest_downloader import Pinterest
 
-async def main():
-    query = "cute cats"
-    results = await pinterest_search(query)
+p = Pinterest()
 
-    for result in results:
-        print(result['url'])
+# Auto-detect URL type
+result = p.get("https://pin.it/xxxxx")
+# {"type": "pin", "data": {...}}
 
-    result = await download_pinterest_media("https://pin.it/6nEi5NMe9", return_url=True)
-    if result['success']:
-        print(f"Type: {result['type']}, URL: {result['url']}")
+# Get pin data (image / video / gif)
+pin = p.get_pin("https://www.pinterest.com/pin/123456/")
 
-if __name__ == "__main__":
-    asyncio.run(main())
+# Get user profile + boards
+user = p.get_user("https://www.pinterest.com/username/")
+
+# Get board info
+board = p.get_board("https://www.pinterest.com/username/board-name/")
+
+# Search
+results = p.search("cute cats")
 ```
 
-## Available Functions
+## Pin Types
 
-1. `pinterest_search(query: str) -> List[Dict[str, str]]`
+| Type | Fields |
+|------|--------|
+| `image` | `default_image`, `images` |
+| `video` | `default_video`, `default_image`, `videos`, `images` |
+| `gif` | `gif_url`, `default_image`, `images` |
 
-    1. Searches Pinterest for images based on the given query.
-    2. Returns a list of dictionaries containing image URLs and thumbnails.
+## Pin Response
 
-2. `download_pinterest_media(url: str, output_dir: str = '.', return_url: bool = False) -> Dict[str, Any]`
+```python
+{
+    "pin_id": "123456",
+    "type": "video",
+    "title": "...",
+    "description": "...",
+    "created_at": "...",
+    "domain": "...",
+    "dominant_color": "#hex",
+    "repin_count": 100,
+    "total_saves": 500,
+    "categories": ["Art"],
+    "visual_annotations": ["..."],
+    "creator": {"name": "...", "username": "...", "entity_id": "...", "image": "..."},
+    "pinner": {"name": "...", "username": "...", "entity_id": "...", "image": "..."},
+    "board": {"name": "...", "url": "...", "entity_id": "..."},
+    "default_image": "https://...",
+    "default_video": "https://...",
+    "gif_url": "https://...",
+    "images": {"236x": "...", "474x": "...", "736x": "...", "orig": "..."},
+    "videos": [{"quality": "v720P", "url": "...", "width": 720, "height": 720, "duration_ms": 9000}],
+}
+```
 
-    1. Downloads a single image or video from Pinterest.
-    2. Returns a dictionary with information about the downloaded media.
+## User Response
+
+```python
+{
+    "user_id": "...",
+    "username": "...",
+    "full_name": "...",
+    "about": "...",
+    "follower_count": 100,
+    "following_count": 50,
+    "pin_count": 200,
+    "board_count": 5,
+    "created_at": "...",
+    "profile_images": {"small": "...", "medium": "...", "large": "..."},
+    "profile_cover": {"originals": "...", "736x": "..."},
+    "boards": [{"name": "...", "pin_count": 10, "url": "..."}],
+}
+```
+
+## Board Response
+
+```python
+{
+    "board_id": "...",
+    "name": "...",
+    "url": "...",
+    "pin_count": 23,
+    "follower_count": 100,
+    "cover_images": {"200x150": "..."},
+    "preview_images": ["...", "..."],
+    "owner": {"name": "...", "username": "..."},
+}
+```
+
+## Exceptions
+
+```python
+from pinterest_downloader import (
+    PinterestError,
+    PinNotFoundError,
+    UserNotFoundError,
+    BoardNotFoundError,
+    SearchError,
+    InvalidURLError,
+)
+```
+
+## Supported URLs
+
+- `https://pin.it/xxxxx`
+- `https://www.pinterest.com/pin/123456/`
+- `https://www.pinterest.com/username/`
+- `https://www.pinterest.com/username/board-name/`
+- `https://www.pinterest.com/search/pins/?q=query`
+
+## License
+
+MIT — Ahmed Nagm
