@@ -1,357 +1,696 @@
 import re
 import json
-import urllib.request
-import urllib.error
-import urllib.parse
-import http.cookiejar
-from .exceptions import (
-    PinNotFoundError,
-    UserNotFoundError,
-    BoardNotFoundError,
-    SearchError,
-    InvalidURLError,
-)
+import html
+import requests
+from urllib.parse import urlparse
+from bs4 import BeautifulSoup
 
+REACTION_LABELS = {
+    "1": "like",
+    "2": "love",
+    "3": "applause",
+    "4": "surprised",
+    "5": "good_idea",
+    "6": "wow",
+    "7": "funny",
+    "8": "thanks",
+}
 
 class Pinterest:
+    DEFAULT_HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "image/avif,image/webp,*/*;q=0.8"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    BASE_URL = "https://www.pinterest.com"
 
-    def __init__(self, user_agent=None, timeout=30):
-        self._ua = user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        self._timeout = timeout
-        self._cj = http.cookiejar.CookieJar()
-        self._opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self._cj))
-
-    def _fetch(self, url):
-        req = urllib.request.Request(url, headers={
-            "User-Agent": self._ua,
-            "Accept-Language": "en-US,en;q=0.9",
-        })
-        try:
-            resp = self._opener.open(req, timeout=self._timeout)
-            return resp.url, resp.read().decode("utf-8", errors="replace")
-        except urllib.error.HTTPError as e:
-            if e.status in (301, 302, 303, 307, 308) and e.headers.get("Location"):
-                return self._fetch(e.headers["Location"])
-            raise
+    def __init__(self, headers=None, timeout=30, proxies=None):
+        self.timeout = timeout
+        self.proxies = proxies
+        self.session = requests.Session()
+        self.session.headers.update(self.DEFAULT_HEADERS)
+        if headers:
+            self.session.headers.update(headers)
 
     def _clean(self, data):
         if isinstance(data, dict):
-            cleaned = {}
-            for k, v in data.items():
-                v = self._clean(v)
-                if v is not None:
-                    cleaned[k] = v
-            return cleaned if cleaned else None
-        elif isinstance(data, list):
-            cleaned = [self._clean(i) for i in data if self._clean(i) is not None]
-            return cleaned if cleaned else None
-        elif isinstance(data, str):
-            return data.strip() if data.strip() else None
-        else:
-            return data
-
-    def _resolve(self, url):
-        if "pin.it" in url:
-            url, _ = self._fetch(url)
-        return url
-
-    def _get_relay_pin(self, html):
-        for match in re.finditer(r'window\.__PWS_RELAY_REGISTER_COMPLETED_REQUEST__\("[^"]*",\s*(\{.*?\})\)', html):
-            try:
-                block = json.loads(match.group(1))
-                query = block.get("data", {}).get("v3GetPinQuery")
-                if query:
-                    return query.get("data", query)
-            except json.JSONDecodeError:
-                continue
-        return None
-
-    def _get_redux_state(self, html):
-        for m in re.finditer(r'<script[^>]*type="application/json"[^>]*>(.*?)</script>', html, re.DOTALL):
-            try:
-                d = json.loads(m.group(1))
-                if "initialReduxState" in d:
-                    return d["initialReduxState"]
-            except json.JSONDecodeError:
-                continue
-        return None
-
-    def _extract_images(self, data):
-        images = {}
-        for key, val in data.items():
-            if key.startswith("images_") and isinstance(val, dict) and val.get("url"):
-                images[key.replace("images_", "")] = val["url"]
-        if data.get("imageLargeUrl"):
-            images["1200x"] = data["imageLargeUrl"]
-        return images if images else None
-
-    def _extract_videos(self, data):
-        story = data.get("storyPinData") or {}
-        videos = []
-        for page in story.get("pages") or []:
-            for block in page.get("blocks") or []:
-                if block.get("__typename") != "StoryPinVideoBlock":
-                    continue
-                for list_val in (block.get("videoDataV2") or {}).values():
-                    if not isinstance(list_val, dict):
-                        continue
-                    for qk, qv in list_val.items():
-                        if not isinstance(qv, dict) or not qv.get("url"):
-                            continue
-                        videos.append({
-                            "quality": qk,
-                            "url": qv["url"],
-                            "thumbnail": qv.get("thumbnail"),
-                            "width": qv.get("width"),
-                            "height": qv.get("height"),
-                            "duration_ms": qv.get("duration"),
-                        })
-        return videos if videos else None
-
-    def _extract_embed(self, data):
-        embed = data.get("embed")
-        if not embed or not embed.get("src"):
+            cleaned = {k: self._clean(v) for k, v in data.items() if v is not None and v != "" and v != " "}
+            return {k: v for k, v in cleaned.items() if not (isinstance(v, (dict, list)) and len(v) == 0)}
+        if isinstance(data, list):
+            filtered = [self._clean(x) for x in data if x is not None and x != "" and x != " "]
+            return [x for x in filtered if not (isinstance(x, (dict, list)) and len(x) == 0)]
+        if isinstance(data, str) and not data.strip():
             return None
-        return {"type": embed.get("type"), "url": embed.get("src")}
+        return data
 
-    def _format_user_short(self, data):
-        if not data:
+    def _val(self, v, is_url=False):
+        t = str(v).strip() if v is not None else None
+        if not t or t in {"\u200c", "\u200f", "\ufeff", ""}:
             return None
-        return {
-            "name": data.get("fullName") or data.get("full_name") or data.get("firstName") or data.get("first_name"),
-            "username": data.get("username"),
-            "entity_id": data.get("entityId") or data.get("id"),
-            "image": data.get("imageLargeUrl") or data.get("imageMediumUrl") or data.get("image_medium_url"),
+        if is_url and t.startswith("//"):
+            return f"https:{t}"
+        return t
+
+    def _extract_username(self, identifier):
+        if not identifier:
+            return None
+        if identifier.startswith("http://") or identifier.startswith("https://"):
+            path = urlparse(identifier).path.strip("/")
+            parts = [p for p in path.split("/") if p]
+            if parts:
+                return parts[0]
+            return None
+        m = re.search(r"^/?([a-zA-Z0-9._-]+)/?$", identifier.strip("/"))
+        if m:
+            return m.group(1)
+        return identifier
+
+    def _parse_reactions(self, reaction_counts):
+        if not isinstance(reaction_counts, dict):
+            return {}
+        result = {}
+        total = 0
+        for key, count in reaction_counts.items():
+            if isinstance(count, (int, float)):
+                label = REACTION_LABELS.get(key, f"type_{key}")
+                result[label] = count
+                total += count
+        result["total"] = total
+        return result
+
+    def search(self, query, page_size=25, bookmark=None):
+        url = f"{self.BASE_URL}/resource/BaseSearchResource/get/"
+        payload = {
+            "source_url": f"/search/pins/?q={query}",
+            "data": json.dumps({
+                "options": {
+                    "query": query,
+                    "scope": "pins",
+                    "page_size": page_size,
+                    "bookmarks": [bookmark] if bookmark else []
+                },
+                "context": {}
+            })
         }
-
-    def _detect_type(self, url):
-        parsed = urllib.parse.urlparse(url)
-        path = parsed.path.rstrip("/")
-        parts = [p for p in path.split("/") if p]
-        if re.search(r"/pin/\d+", url):
-            return "pin"
-        elif re.search(r"/search/", url):
-            return "search"
-        elif len(parts) == 1 and parts[0] not in ("search", "pin", "settings", "password"):
-            return "user"
-        elif len(parts) >= 2 and parts[0] not in ("search", "pin", "settings", "password") and not parts[1].startswith("_"):
-            return "board"
-        return None
-
-    def get(self, url):
-        url = self._resolve(url)
-        url_type = self._detect_type(url)
-        if url_type == "pin":
-            return {"type": "pin", "data": self.get_pin(url)}
-        elif url_type == "search":
-            m = re.search(r"[?&]q=([^&]+)", url)
-            query = urllib.parse.unquote_plus(m.group(1)) if m else ""
-            return {"type": "search", "data": self.search(query)}
-        elif url_type == "user":
-            return {"type": "user", "data": self.get_user(url)}
-        elif url_type == "board":
-            return {"type": "board", "data": self.get_board(url)}
-        raise InvalidURLError(f"Unknown URL type: {url}")
-
-    def get_pin(self, url):
-        url = self._resolve(url)
-        m = re.search(r"/pin/(\d+)", url)
-        if not m:
-            raise InvalidURLError(f"Could not extract pin ID from: {url}")
-        _, html = self._fetch(f"https://www.pinterest.com/pin/{m.group(1)}/")
-        pin = self._get_relay_pin(html)
-        if not pin:
-            raise PinNotFoundError(f"Pin not found: {m.group(1)}")
-
-        images = self._extract_images(pin)
-        videos = self._extract_videos(pin)
-        embed = self._extract_embed(pin)
-        creator = pin.get("nativeCreator") or pin.get("closeupAttribution") or {}
-        origin = pin.get("originPinner") or {}
-        pinner = pin.get("pinner") or {}
-        board = pin.get("board") or {}
-        agg = (pin.get("aggregatedPinData") or {}).get("aggregatedStats") or {}
-        pin_join = pin.get("pinJoin") or {}
-
-        is_gif = embed and embed.get("type") == "gif"
-        orig_url = (pin.get("images_orig") or {}).get("url")
-
-        default_video = None
-        if videos:
-            mp4s = [v for v in videos if v["url"].endswith(".mp4")]
-            default_video = mp4s[0]["url"] if mp4s else videos[0]["url"]
-
-        result = {
-            "pin_id": pin.get("entityId"),
-            "created_at": pin.get("createdAt"),
-            "title": pin.get("title") or pin.get("gridTitle"),
-            "description": (pin.get("description") or "").strip(),
-            "domain": pin.get("domain"),
-            "link": pin.get("link"),
-            "dominant_color": pin.get("dominantColor"),
-            "repin_count": pin.get("repinCount"),
-            "total_saves": agg.get("saves"),
-            "categories": [b.get("name") for b in (pin_join.get("seoBreadcrumbs") or [])],
-            "visual_annotations": pin_join.get("visualAnnotation"),
-            "creator": self._clean(self._format_user_short(creator) or self._format_user_short(origin)),
-            "pinner": self._clean(self._format_user_short(pinner)),
-            "board": {
-                "name": board.get("name"),
-                "url": board.get("url"),
-                "entity_id": board.get("entityId"),
-                "is_collaborative": board.get("isCollaborative"),
-            },
-            "type": "gif" if is_gif else ("video" if videos else "image"),
-            "default_image": orig_url or (images or {}).get("originals") or (images or {}).get("736x"),
-            "default_video": default_video,
-            "gif_url": embed.get("url") if is_gif else None,
-            "images": images,
-            "videos": videos,
-            "image_signature": pin.get("imageSignature"),
+        headers = {
+            "X-Pinterest-PWS-Handler": "www/[username]/search/pins.js",
+            "User-Agent": self.DEFAULT_HEADERS["User-Agent"]
         }
-        return self._clean(result)
+        try:
+            resp = self.session.get(url, params=payload, headers=headers, timeout=self.timeout, proxies=self.proxies)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
-    def get_user(self, url):
-        url = self._resolve(url)
-        if not re.search(r"pinterest\.com/[^/]+/?$", url):
-            m = re.search(r"pinterest\.com/([^/?]+)", url)
-            if m:
-                url = f"https://www.pinterest.com/{m.group(1)}/"
-        _, html = self._fetch(url)
-        state = self._get_redux_state(html)
-        if not state:
-            raise UserNotFoundError("Could not find user data.")
+        resource_response = data.get("resource_response", {})
+        if not resource_response.get("status") == "success":
+            return {"ok": False, "error": resource_response.get("message", "Unknown error")}
 
-        user_data = None
-        for uid, u in state.get("users", {}).items():
-            if u.get("username"):
-                user_data = u
+        results = resource_response.get("data", {}).get("results", [])
+        next_bookmark = resource_response.get("bookmark")
+
+        pins = []
+        for pin_data in results:
+            if not isinstance(pin_data, dict):
+                continue
+
+            pin_id = self._val(pin_data.get("id"))
+            if not pin_id:
+                continue
+
+            title = self._val(pin_data.get("title") or pin_data.get("grid_title"))
+            description = self._val(pin_data.get("description"))
+            created_at = self._val(pin_data.get("created_at"))
+            external_link = self._val(pin_data.get("link"))
+            is_uploaded = pin_data.get("is_uploaded")
+            domain = self._val(pin_data.get("domain"))
+            dominant_color = self._val(pin_data.get("dominant_color"))
+            comment_count = pin_data.get("comment_count", 0)
+
+            images = {}
+            raw_images = pin_data.get("images", {})
+            if isinstance(raw_images, dict):
+                for size_key, img_obj in raw_images.items():
+                    if isinstance(img_obj, dict):
+                        img_url = self._val(img_obj.get("url"), True)
+                        if img_url:
+                            images[size_key] = {
+                                "url": img_url,
+                                "width": img_obj.get("width"),
+                                "height": img_obj.get("height")
+                            }
+
+            orig = images.get("orig", {})
+            original_url = orig.get("url") if orig else None
+            if not original_url and images:
+                last = list(images.values())[-1]
+                original_url = last.get("url")
+
+            media_type = "image"
+            video_formats = []
+            video_poster = None
+
+            story = pin_data.get("story_pin_data", {})
+            if isinstance(story, dict):
+                pages = story.get("pages", [])
+                for page in pages:
+                    for block in page.get("blocks", []):
+                        if block.get("block_type") == 3:
+                            video = block.get("video", {})
+                            vlist = video.get("video_list", {})
+                            for vkey, vobj in vlist.items():
+                                if isinstance(vobj, dict):
+                                    vurl = self._val(vobj.get("url"), True)
+                                    if vurl:
+                                        video_formats.append({
+                                            "quality": vkey,
+                                            "url": vurl,
+                                            "width": vobj.get("width"),
+                                            "height": vobj.get("height"),
+                                            "duration": vobj.get("duration"),
+                                            "thumbnail": self._val(vobj.get("thumbnail"), True)
+                                        })
+                                        if not video_poster:
+                                            video_poster = self._val(vobj.get("thumbnail"), True)
+                if video_formats:
+                    media_type = "video"
+
+            if not video_formats:
+                top_videos = pin_data.get("videos", {})
+                if isinstance(top_videos, dict):
+                    vlist = top_videos.get("video_list") or top_videos.get("videoUrls") or {}
+                    for vkey, vobj in vlist.items():
+                        if isinstance(vobj, dict):
+                            vurl = self._val(vobj.get("url"), True)
+                            if vurl:
+                                video_formats.append({
+                                    "quality": vkey,
+                                    "url": vurl,
+                                    "width": vobj.get("width"),
+                                    "height": vobj.get("height"),
+                                    "duration": vobj.get("duration"),
+                                    "thumbnail": self._val(vobj.get("thumbnail"), True)
+                                })
+                                if not video_poster:
+                                    video_poster = self._val(vobj.get("thumbnail"), True)
+                if video_formats:
+                    media_type = "video"
+
+            if media_type == "image" and original_url and original_url.lower().endswith(".gif"):
+                media_type = "gif"
+
+            pinner = pin_data.get("pinner", {})
+            author = {
+                "id": self._val(pinner.get("id")),
+                "username": self._val(pinner.get("username")),
+                "full_name": self._val(pinner.get("full_name")),
+                "image_url": self._val(pinner.get("image_medium_url") or pinner.get("image_large_url"), True)
+            }
+
+            board_data = pin_data.get("board", {})
+            board = {
+                "id": self._val(board_data.get("id")),
+                "name": self._val(board_data.get("name")),
+                "url": f"{self.BASE_URL}{board_data.get('url')}" if board_data.get("url") else None
+            }
+
+            reactions = self._parse_reactions(pin_data.get("reaction_counts", {}))
+            engagement = {
+                "reactions": reactions.get("total", 0),
+                "reactions_detail": reactions,
+                "comment_count": comment_count
+            }
+
+            embed = None
+            raw_embed = pin_data.get("embed")
+            if isinstance(raw_embed, dict):
+                embed = {
+                    "src": self._val(raw_embed.get("src"), True),
+                    "width": raw_embed.get("width"),
+                    "height": raw_embed.get("height"),
+                    "type": raw_embed.get("type")
+                }
+
+            attribution = None
+            raw_att = pin_data.get("attribution")
+            if isinstance(raw_att, dict):
+                attribution = {
+                    "title": self._val(raw_att.get("title")),
+                    "author_name": self._val(raw_att.get("author_name")),
+                    "author_url": self._val(raw_att.get("author_url")),
+                    "provider_name": self._val(raw_att.get("provider_name")),
+                    "provider_icon_url": self._val(raw_att.get("provider_icon_url"), True)
+                }
+
+            source = None
+            rich = pin_data.get("rich_summary")
+            if isinstance(rich, dict):
+                source = {
+                    "url": self._val(rich.get("url")),
+                    "site_name": self._val(rich.get("site_name")),
+                    "display_name": self._val(rich.get("display_name")),
+                    "type_name": self._val(rich.get("type_name"))
+                }
+
+            pin_obj = {
+                "id": pin_id,
+                "title": title,
+                "description": description,
+                "url": f"{self.BASE_URL}/pin/{pin_id}/",
+                "external_link": external_link,
+                "media_type": media_type,
+                "images": images,
+                "created_at": created_at,
+                "author": author,
+                "board": board,
+                "engagement": engagement,
+                "is_uploaded": is_uploaded,
+                "domain": domain,
+                "dominant_color": dominant_color
+            }
+
+            if video_formats:
+                mp4_formats = [f for f in video_formats if f.get("url", "").endswith(".mp4")]
+                hls_formats = [f for f in video_formats if not f.get("url", "").endswith(".mp4")]
+                pin_obj["video"] = {
+                    "formats": video_formats,
+                    "mp4_available": bool(mp4_formats),
+                    "poster": video_poster or original_url
+                }
+            if embed:
+                pin_obj["embed"] = embed
+            if attribution:
+                pin_obj["attribution"] = attribution
+            if source:
+                pin_obj["source"] = source
+
+            pins.append(pin_obj)
+
+        return self._clean({
+            "ok": True,
+            "query": query,
+            "bookmark": next_bookmark,
+            "pins": pins
+        })
+
+    def search_all(self, query, max_pages=5):
+        all_pins = []
+        bookmark = None
+        for _ in range(max_pages):
+            result = self.search(query, bookmark=bookmark)
+            if not result.get("ok"):
                 break
-        if not user_data:
-            raise UserNotFoundError("Could not find user data.")
+            all_pins.extend(result.get("pins", []))
+            bookmark = result.get("bookmark")
+            if not bookmark:
+                break
+        return {"ok": True, "query": query, "total": len(all_pins), "pins": all_pins}
+
+    def get_profile(self, identifier):
+        username = self._extract_username(identifier)
+        if not username:
+            return {"ok": False, "error": {"message": "Invalid identifier"}}
+        try:
+            resp = self.session.get(f"{self.BASE_URL}/{username}/", timeout=self.timeout, proxies=self.proxies)
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            return {"ok": False, "error": {"message": str(e)}}
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        tag = soup.find("script", id="__PWS_INITIAL_PROPS__")
+        redux = json.loads(tag.get_text().strip()).get("initialReduxState", {}) if tag else {}
+
+        profile = {"username": username, "profile_url": f"{self.BASE_URL}/{username}/"}
+        users = redux.get("users", {}) or {}
+        uid, udata = next(((k, v) for k, v in users.items() if isinstance(v, dict) and v.get("username") == username), (None, {}))
+        if not udata:
+            uid, udata = next(((k, v) for k, v in users.items() if isinstance(v, dict) and v.get("type") == "user"), (None, {}))
+
+        if udata:
+            for k in ["full_name", "follower_count", "following_count", "pin_count", "about", "website_url"]:
+                profile[k] = udata.get(k)
+            profile["id"] = str(uid) if uid else None
+            profile["image_url"] = self._val(udata.get("image_medium_url"), True)
+
+        if not profile.get("id"):
+            ld_tag = soup.find("script", attrs={"data-test-id": "profile-snippet", "type": "application/ld+json"})
+            if ld_tag:
+                try:
+                    ld = json.loads(ld_tag.get_text().strip()).get("mainEntity", {})
+                    profile["full_name"] = ld.get("name", profile.get("full_name"))
+                    img = ld.get("image", {})
+                    if isinstance(img, dict):
+                        profile["image_url"] = img.get("contentUrl")
+                except Exception:
+                    pass
 
         boards = []
-        for bid, b in state.get("boards", {}).items():
-            if not b.get("name"):
+        for bid, bdata in (redux.get("boards", {}) or {}).items():
+            if isinstance(bdata, dict) and bdata.get("name"):
+                b_url = bdata.get("url")
+                boards.append({
+                    "id": str(bid),
+                    "name": bdata.get("name"),
+                    "board_url": f"{self.BASE_URL}{b_url}" if b_url else f"{self.BASE_URL}/{username}/{bdata['name'].lower().replace(' ', '-')}/",
+                    "cover_url": self._val(bdata.get("image_cover_url"), True)
+                })
+
+        return self._clean({
+            "ok": True,
+            "resolved_url": resp.url,
+            "profile": profile,
+            "boards": boards
+        })
+
+    def get_boards(self, identifier):
+        username = self._extract_username(identifier)
+        if not username:
+            return {"ok": False, "error": {"message": "Invalid identifier"}}
+        try:
+            resp = self.session.get(f"{self.BASE_URL}/{username}/", timeout=self.timeout, proxies=self.proxies)
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            return {"ok": False, "error": {"message": str(e)}}
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        tag = soup.find("script", id="__PWS_INITIAL_PROPS__")
+        redux = json.loads(tag.get_text().strip()).get("initialReduxState", {}) if tag else {}
+
+        boards = []
+        for bid, bdata in (redux.get("boards", {}) or {}).items():
+            if not isinstance(bdata, dict) or not bdata.get("name"):
                 continue
+            b_url = bdata.get("url")
+            board_url = f"{self.BASE_URL}{b_url}" if b_url else f"{self.BASE_URL}/{username}/{bdata['name'].lower().replace(' ', '-').replace('_', '-')}/"
+            owner = bdata.get("owner", {})
             boards.append({
-                "id": b.get("id"),
-                "name": b.get("name"),
-                "url": b.get("url"),
-                "description": (b.get("description") or "").strip(),
-                "pin_count": b.get("pin_count"),
-                "follower_count": b.get("follower_count"),
-                "section_count": b.get("section_count"),
-                "privacy": b.get("privacy"),
-                "is_collaborative": b.get("is_collaborative"),
-                "cover_image": (b.get("cover_images") or {}).get("200x150", {}).get("url"),
-                "created_at": b.get("created_at"),
+                "id": str(bid),
+                "name": bdata.get("name"),
+                "description": bdata.get("description"),
+                "category": bdata.get("category"),
+                "privacy": bdata.get("privacy"),
+                "pin_count": bdata.get("pin_count"),
+                "cover_url": self._val(bdata.get("image_cover_url") or bdata.get("image_cover_hd_url"), True),
+                "board_url": board_url,
+                "owner": {"id": str(owner.get("id")) if owner.get("id") else None, "username": owner.get("username")}
             })
 
-        cover = user_data.get("profile_cover") or {}
-        cover_images = {k: v.get("url") for k, v in (cover.get("images") or {}).items() if isinstance(v, dict) and v.get("url")}
-
-        result = {
-            "user_id": user_data.get("id"),
-            "username": user_data.get("username"),
-            "full_name": user_data.get("full_name"),
-            "first_name": user_data.get("first_name"),
-            "about": (user_data.get("about") or "").strip(),
-            "website_url": user_data.get("website_url"),
-            "domain_url": user_data.get("domain_url"),
-            "domain_verified": user_data.get("domain_verified"),
-            "is_verified_merchant": user_data.get("is_verified_merchant"),
-            "is_partner": user_data.get("is_partner"),
-            "is_private_profile": user_data.get("is_private_profile"),
-            "created_at": user_data.get("created_at"),
-            "follower_count": user_data.get("follower_count"),
-            "following_count": user_data.get("following_count"),
-            "pin_count": user_data.get("pin_count"),
-            "board_count": user_data.get("board_count"),
-            "last_pin_save_time": user_data.get("last_pin_save_time"),
-            "profile_images": {
-                "small": user_data.get("image_small_url"),
-                "medium": user_data.get("image_medium_url"),
-                "large": user_data.get("image_xlarge_url"),
-            },
-            "profile_cover": cover_images,
-            "eligible_profile_tabs": [t.get("name") for t in (user_data.get("eligible_profile_tabs") or [])],
-            "boards": boards,
-        }
-        return self._clean(result)
+        return self._clean({
+            "ok": True,
+            "resolved_url": resp.url,
+            "username": username,
+            "boards": boards
+        })
 
     def get_board(self, url):
-        url = self._resolve(url)
-        _, html = self._fetch(url)
-        state = self._get_redux_state(html)
-        if not state:
-            raise BoardNotFoundError("Could not find board data.")
-
-        board_data = None
-        for bid, b in state.get("boards", {}).items():
-            if b.get("name"):
-                board_data = b
-                break
-        if not board_data:
-            raise BoardNotFoundError("Could not find board data.")
-
-        owner = board_data.get("owner") or {}
-        cover = board_data.get("cover_images") or {}
-
-        result = {
-            "board_id": board_data.get("id"),
-            "name": board_data.get("name"),
-            "url": board_data.get("url"),
-            "description": (board_data.get("description") or "").strip(),
-            "privacy": board_data.get("privacy"),
-            "layout": board_data.get("layout"),
-            "created_at": board_data.get("created_at"),
-            "pin_count": board_data.get("pin_count"),
-            "follower_count": board_data.get("follower_count"),
-            "collaborator_count": board_data.get("collaborator_count"),
-            "section_count": board_data.get("section_count"),
-            "is_collaborative": board_data.get("is_collaborative"),
-            "has_custom_cover": board_data.get("has_custom_cover"),
-            "cover_images": {k: v.get("url") for k, v in cover.items() if isinstance(v, dict) and v.get("url")},
-            "cover_hd": board_data.get("image_cover_hd_url"),
-            "preview_images": [img.get("url") for img in (board_data.get("images", {}).get("170x") or []) if img.get("url")],
-            "owner": self._clean(self._format_user_short(owner)),
-        }
-        return self._clean(result)
-
-    def search(self, query, limit=25):
-        self._fetch("https://www.pinterest.com/")
-        csrf = ""
-        for c in self._cj:
-            if c.name == "csrftoken":
-                csrf = c.value
-        cookies = "; ".join(f"{c.name}={c.value}" for c in self._cj)
-        options = {"options": {"query": query, "scope": "pins", "page_size": limit, "bookmarks": []}, "context": {}}
-        encoded = urllib.parse.quote(json.dumps(options))
-        url = f"https://www.pinterest.com/resource/BaseSearchResource/get/?source_url=%2Fsearch%2Fpins%2F%3Fq%3D{urllib.parse.quote(query)}&data={encoded}"
-        req = urllib.request.Request(url)
-        req.add_header("User-Agent", self._ua)
-        req.add_header("Accept", "application/json, text/javascript, */*, q=0.01")
-        req.add_header("X-Requested-With", "XMLHttpRequest")
-        req.add_header("X-CSRFToken", csrf)
-        req.add_header("X-Pinterest-AppState", "active")
-        req.add_header("Cookie", cookies)
-        req.add_header("Referer", f"https://www.pinterest.com/search/pins/?q={urllib.parse.quote(query)}")
         try:
-            resp = self._opener.open(req, timeout=self._timeout)
-            result = json.loads(resp.read().decode())
-            data = result.get("resource_response", {}).get("data", {})
-            results = data if isinstance(data, list) else data.get("results", [])
-            pins = []
-            for r in results:
-                if not isinstance(r, dict) or not r.get("id"):
-                    continue
-                pins.append({
-                    "pin_id": r.get("id"),
-                    "title": r.get("title") or r.get("grid_title"),
-                    "description": (r.get("description") or "").strip(),
-                    "link": f"https://www.pinterest.com/pin/{r.get('id')}/",
-                })
-            return self._clean(pins) or []
-        except urllib.error.HTTPError:
-            raise SearchError(f"Search failed for: {query}")
+            resp = self.session.get(url, timeout=self.timeout, proxies=self.proxies)
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            return {"ok": False, "error": {"message": str(e)}}
+
+        path_parts = [p for p in urlparse(resp.url).path.strip("/").split("/") if p]
+        if not path_parts:
+            return {"ok": False, "error": {"message": "Invalid URL"}}
+        username = path_parts[0]
+        board_slug = path_parts[1] if len(path_parts) >= 2 else None
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        tag = soup.find("script", id="__PWS_INITIAL_PROPS__")
+        redux = json.loads(tag.get_text().strip()).get("initialReduxState", {}) if tag else {}
+
+        users = redux.get("users", {}) or {}
+        uid, udata = next(((k, v) for k, v in users.items() if isinstance(v, dict) and v.get("username") == username), (None, {}))
+        user_profile = {"username": username, "id": str(uid) if uid else None, "full_name": udata.get("full_name") if udata else None}
+
+        boards = []
+        board = None
+        for bid, bdata in (redux.get("boards", {}) or {}).items():
+            if not isinstance(bdata, dict) or not bdata.get("name"):
+                continue
+            b_url = bdata.get("url")
+            b_slug = bdata["name"].lower().replace(" ", "-").replace("_", "-")
+            entry = {
+                "id": str(bid),
+                "name": bdata.get("name"),
+                "description": bdata.get("description"),
+                "category": bdata.get("category"),
+                "privacy": bdata.get("privacy"),
+                "pin_count": bdata.get("pin_count"),
+                "follower_count": bdata.get("follower_count"),
+                "board_url": f"{self.BASE_URL}{b_url}" if b_url else f"{self.BASE_URL}/{username}/{b_slug}/",
+                "cover_url": self._val(bdata.get("image_cover_url"), True),
+                "owner": {"username": username, "id": user_profile["id"]}
+            }
+            boards.append(entry)
+            if board_slug and (b_slug == board_slug.lower() or str(bid) == board_slug):
+                board = entry
+
+        if not board and boards:
+            board = boards[0]
+
+        return self._clean({
+            "ok": True,
+            "resolved_url": resp.url,
+            "user": user_profile,
+            "board_slug": board_slug,
+            "board": board,
+            "boards": boards
+        })
+
+    def get_pin(self, url):
+        pin_id = None
+        m = re.search(r'/pin/(\d+)', url)
+        if m:
+            pin_id = m.group(1)
+        else:
+            try:
+                resp = self.session.head(url, allow_redirects=True, timeout=self.timeout, proxies=self.proxies)
+                m = re.search(r'/pin/(\d+)', resp.url)
+                if m:
+                    pin_id = m.group(1)
+            except:
+                pass
+        if not pin_id:
+            return {"ok": False, "error": {"message": "Cannot extract pin ID from URL"}}
+
+        try:
+            resp = self.session.get(url, timeout=self.timeout, proxies=self.proxies)
+            resp.raise_for_status()
+            final_url = resp.url
+        except requests.RequestException as e:
+            return {"ok": False, "error": {"message": str(e)}}
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        tag = soup.find("script", id="__PWS_INITIAL_PROPS__")
+        if not tag:
+            return {"ok": False, "error": {"message": "No data found"}}
+        try:
+            data = json.loads(tag.get_text().strip())
+        except Exception:
+            return {"ok": False, "error": {"message": "Failed to parse JSON"}}
+
+        redux = data.get("initialReduxState", {})
+        pins = redux.get("pins", {})
+        pin_data = pins.get(pin_id)
+        if not pin_data:
+            for key, val in pins.items():
+                if isinstance(val, dict) and str(val.get("id")) == pin_id:
+                    pin_data = val
+                    break
+        if not pin_data:
+            return {"ok": False, "error": {"message": "Pin not found in page data"}}
+
+        title = self._val(pin_data.get("title") or pin_data.get("grid_title"))
+        description = self._val(pin_data.get("description"))
+        created_at = self._val(pin_data.get("created_at"))
+        external_link = self._val(pin_data.get("link"))
+        is_uploaded = pin_data.get("is_uploaded")
+        domain = self._val(pin_data.get("domain"))
+        dominant_color = self._val(pin_data.get("dominant_color"))
+        comment_count = pin_data.get("comment_count", 0)
+
+        images = {}
+        raw_images = pin_data.get("images", {})
+        if isinstance(raw_images, dict):
+            for size_key, img_obj in raw_images.items():
+                if isinstance(img_obj, dict):
+                    img_url = self._val(img_obj.get("url"), True)
+                    if img_url:
+                        images[size_key] = {
+                            "url": img_url,
+                            "width": img_obj.get("width"),
+                            "height": img_obj.get("height")
+                        }
+
+        orig = images.get("orig", {})
+        original_url = orig.get("url") if orig else None
+        if not original_url and images:
+            for size_key in ["736x", "474x", "236x"]:
+                u = images.get(size_key, {}).get("url")
+                if u:
+                    original_url = u
+                    break
+
+        media_type = "image"
+        video_formats = []
+        video_poster = None
+
+        story = pin_data.get("story_pin_data", {})
+        if isinstance(story, dict):
+            pages = story.get("pages", [])
+            for page in pages:
+                for block in page.get("blocks", []):
+                    if block.get("block_type") == 3:
+                        video = block.get("video", {})
+                        vlist = video.get("video_list", {})
+                        for vkey, vobj in vlist.items():
+                            if isinstance(vobj, dict):
+                                vurl = self._val(vobj.get("url"), True)
+                                if vurl:
+                                    video_formats.append({
+                                        "quality": vkey,
+                                        "url": vurl,
+                                        "width": vobj.get("width"),
+                                        "height": vobj.get("height"),
+                                        "duration": vobj.get("duration"),
+                                        "thumbnail": self._val(vobj.get("thumbnail"), True)
+                                    })
+                                    if not video_poster:
+                                        video_poster = self._val(vobj.get("thumbnail"), True)
+            if video_formats:
+                media_type = "video"
+
+        if not video_formats:
+            videos = pin_data.get("videos", {})
+            if isinstance(videos, dict):
+                vlist = videos.get("video_list") or videos.get("videoUrls") or {}
+                for vkey, vobj in vlist.items():
+                    if isinstance(vobj, dict):
+                        vurl = self._val(vobj.get("url"), True)
+                        if vurl:
+                            video_formats.append({
+                                "quality": vkey,
+                                "url": vurl,
+                                "width": vobj.get("width"),
+                                "height": vobj.get("height"),
+                                "duration": vobj.get("duration"),
+                                "thumbnail": self._val(vobj.get("thumbnail"), True)
+                            })
+                            if not video_poster:
+                                video_poster = self._val(vobj.get("thumbnail"), True)
+            if video_formats:
+                media_type = "video"
+
+        if media_type == "image" and original_url and original_url.lower().endswith(".gif"):
+            media_type = "gif"
+
+        pinner = pin_data.get("pinner", {})
+        author = {
+            "id": self._val(pinner.get("id")),
+            "username": self._val(pinner.get("username")),
+            "full_name": self._val(pinner.get("full_name")),
+            "image_url": self._val(pinner.get("image_medium_url") or pinner.get("image_large_url"), True)
+        }
+
+        board_data = pin_data.get("board", {})
+        board = {
+            "id": self._val(board_data.get("id")),
+            "name": self._val(board_data.get("name")),
+            "url": f"{self.BASE_URL}{board_data.get('url')}" if board_data.get("url") else None
+        }
+
+        reactions = self._parse_reactions(pin_data.get("reaction_counts", {}))
+        engagement = {
+            "reactions": reactions.get("total", 0),
+            "reactions_detail": reactions,
+            "comment_count": comment_count
+        }
+
+        embed = None
+        raw_embed = pin_data.get("embed")
+        if isinstance(raw_embed, dict):
+            embed = {
+                "src": self._val(raw_embed.get("src"), True),
+                "width": raw_embed.get("width"),
+                "height": raw_embed.get("height"),
+                "type": raw_embed.get("type")
+            }
+
+        attribution = None
+        raw_att = pin_data.get("attribution")
+        if isinstance(raw_att, dict):
+            attribution = {
+                "title": self._val(raw_att.get("title")),
+                "author_name": self._val(raw_att.get("author_name")),
+                "author_url": self._val(raw_att.get("author_url")),
+                "provider_name": self._val(raw_att.get("provider_name")),
+                "provider_icon_url": self._val(raw_att.get("provider_icon_url"), True)
+            }
+
+        source = None
+        rich = pin_data.get("rich_summary")
+        if isinstance(rich, dict):
+            source = {
+                "url": self._val(rich.get("url")),
+                "site_name": self._val(rich.get("site_name")),
+                "display_name": self._val(rich.get("display_name")),
+                "type_name": self._val(rich.get("type_name"))
+            }
+
+        pin_obj = {
+            "id": pin_id,
+            "title": title,
+            "description": description,
+            "url": f"{self.BASE_URL}/pin/{pin_id}/",
+            "source_url": final_url,
+            "external_link": external_link,
+            "media_type": media_type,
+            "images": images,
+            "created_at": created_at,
+            "author": author,
+            "board": board,
+            "engagement": engagement,
+            "is_uploaded": is_uploaded,
+            "domain": domain,
+            "dominant_color": dominant_color
+        }
+
+        if video_formats:
+            mp4_formats = [f for f in video_formats if f.get("url", "").endswith(".mp4")]
+            hls_formats = [f for f in video_formats if not f.get("url", "").endswith(".mp4")]
+            pin_obj["video"] = {
+                "formats": video_formats,
+                "mp4_available": bool(mp4_formats),
+                "poster": video_poster or original_url
+            }
+        if embed:
+            pin_obj["embed"] = embed
+        if attribution:
+            pin_obj["attribution"] = attribution
+        if source:
+            pin_obj["source"] = source
+
+        return self._clean({
+            "ok": True,
+            "pin": pin_obj,
+            "author": author,
+            "board": board,
+            "media": {
+                "type": media_type,
+                "url": original_url,
+                "video_formats": video_formats if video_formats else None,
+                "poster": video_poster
+            },
+            "engagement": engagement
+        })
