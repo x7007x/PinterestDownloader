@@ -1,4 +1,3 @@
-```markdown
 # pinterest-downloader v3
 
 Unofficial library to download and interact with Pinterest content. No API key required.
@@ -272,5 +271,3 @@ No exceptions are raised by the library itself. Always check the "ok" key.
 License
 
 MIT — Ahmed Negm
-
-```
