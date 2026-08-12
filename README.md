@@ -1,6 +1,18 @@
-# pinterest-downloader v3
+# pinterest-downloader
 
-Unofficial library to download and interact with Pinterest content. No API key required.
+Unofficial Python library to download and interact with Pinterest content —
+pins, videos, GIFs, profiles, and boards — without an API key.
+
+## Features
+
+- 🔎 **Search pins** — paginated keyword search with bookmark support
+- 📌 **Fetch single pins** — full metadata for images, videos, and GIFs
+  (direct MP4 + HLS links, posters, embed data, source attribution)
+- 👤 **User profiles** — follower/following counts, pin counts, bio, boards
+- 📁 **Boards** — board metadata, cover images, and full board lists per user
+- 🛡️ **Graceful errors** — every method returns a dict with an `ok` flag and a
+  descriptive `error.message`; no exceptions are raised by the library itself
+- 🚀 **No API key required** — works with public Pinterest data
 
 ## Install
 
@@ -8,9 +20,9 @@ Unofficial library to download and interact with Pinterest content. No API key r
 pip install pinterest-downloader
 ```
 
-Dependencies: requests, beautifulsoup4 (automatically installed).
+Dependencies (`requests`, `beautifulsoup4`) are installed automatically.
 
-Quick Start
+## Quick Start
 
 ```python
 from pinterest_downloader import Pinterest
@@ -34,17 +46,16 @@ for pin in result["pins"]:
     print(pin["id"], pin["media_type"])
 ```
 
-All functions return a dictionary with an "ok" key (True on success, False on error). If "ok" is False, an "error" key contains a message.
+All functions return a dictionary with an `"ok"` key (`True` on success,
+`False` on error). If `ok` is `False`, an `error` key contains a message.
 
-Available Methods
+## API Reference
 
-get_pin(url_or_id)
+### `get_pin(url_or_id)`
 
 Retrieves all available data for a single pin.
 
-Accepts: full pin URL, short pin.it link, or numeric pin ID.
-
-Returns:
+**Accepts:** full pin URL, short `pin.it` link, or numeric pin ID.
 
 ```python
 {
@@ -71,15 +82,15 @@ Returns:
         "video": {                        # only for videos
             "formats": [
                 {
-                    "quality": "V_HLSV3_MOBILE",
-                    "url": "https://...",
+                    "quality": "V_720P",
+                    "url": "https://...mp4",
                     "width": 1920,
                     "height": 1080,
                     "duration": 11378,
                     "thumbnail": "https://..."
                 }
             ],
-            "mp4_available": False,
+            "mp4_available": True,
             "poster": "https://..."
         },
         "embed": {                        # if available
@@ -121,20 +132,18 @@ Returns:
 }
 ```
 
-· Reaction labels are descriptive: like, love, wow, funny, etc. (if the API reports them).
-· Videos include both HLS (.m3u8) and direct MP4 links when available (mp4_available flag).
+- Reaction labels are descriptive: `like`, `love`, `wow`, `funny`, etc.
+- Videos include both HLS (`.m3u8`) and direct MP4 links when available
+  (`mp4_available` flag).
 
-search(query, page_size=25, bookmark=None)
+### `search(query, page_size=25, bookmark=None)`
 
 Searches for pins and returns a page of results.
 
-Parameters:
-
-· query – search keywords.
-· page_size – number of results per page (max 25).
-· bookmark – used for pagination; pass the "bookmark" value from a previous response to get the next page.
-
-Returns:
+- `query` – search keywords.
+- `page_size` – number of results per page (max 25).
+- `bookmark` – used for pagination; pass the `"bookmark"` value from a
+  previous response to get the next page.
 
 ```python
 {
@@ -148,11 +157,9 @@ Returns:
 }
 ```
 
-search_all(query, max_pages=5)
+### `search_all(query, max_pages=5)`
 
 Convenience method that fetches multiple pages of search results automatically.
-
-Returns:
 
 ```python
 {
@@ -163,13 +170,11 @@ Returns:
 }
 ```
 
-get_profile(identifier)
+### `get_profile(identifier)`
 
 Retrieves a user's public profile and their boards.
 
-Accepts: username, pinterest.com/username URL, or user ID.
-
-Returns:
+**Accepts:** username, `pinterest.com/username` URL, or user ID.
 
 ```python
 {
@@ -199,13 +204,11 @@ Returns:
 }
 ```
 
-get_boards(identifier)
+### `get_boards(identifier)`
 
 Returns a detailed list of all boards for a user.
 
-Accepts: same as get_profile.
-
-Returns:
+**Accepts:** same as `get_profile`.
 
 ```python
 {
@@ -228,13 +231,11 @@ Returns:
 }
 ```
 
-get_board(url)
+### `get_board(url)`
 
 Retrieves a specific board and also returns the user's full board list.
 
-Accepts: board URL (required).
-
-Returns:
+**Accepts:** board URL (required).
 
 ```python
 {
@@ -258,16 +259,25 @@ Returns:
 }
 ```
 
-Error Handling
+## Error Handling
 
-When something goes wrong, the function returns:
+When something goes wrong, every method returns:
 
 ```python
 {"ok": False, "error": {"message": "description of the problem"}}
 ```
 
-No exceptions are raised by the library itself. Always check the "ok" key.
+No exceptions are raised by the library itself. Always check the `"ok"` key.
 
-License
+## Development
+
+Run the live smoke tests (requires network access):
+
+```bash
+pip install requests beautifulsoup4
+python3 test_live.py
+```
+
+## License
 
 MIT — Ahmed Negm
