@@ -1,3 +1,4 @@
+import os
 import re
 import json
 import requests
@@ -323,17 +324,21 @@ class Pinterest:
     # ------------------------------------------------------------------
     # Search
     # ------------------------------------------------------------------
-    def search(self, query, page_size=25, bookmark=None):
+    def search(self, query, page_size=25, bookmark=None, scope="pins"):
+        """Search for pins (scope="pins") or videos (scope="videos")."""
+        if scope == "boards":
+            return self.search_boards(query, page_size=page_size, bookmark=bookmark)
+        source_url = f"/search/{scope}/?q={query}" if scope != "pins" else f"/search/pins/?q={query}"
         options = {
             "query": query,
-            "scope": "pins",
+            "scope": scope,
             "page_size": page_size,
             "bookmarks": [bookmark] if bookmark else []
         }
         ok, resource_response = self._api(
             "BaseSearchResource/get",
             options,
-            f"/search/pins/?q={query}",
+            source_url,
             "www/[username]/search/pins.js",
         )
         if not ok:
@@ -581,6 +586,315 @@ class Pinterest:
             "board_slug": board_slug,
             "board": board,
             "boards": boards
+        })
+
+    # ------------------------------------------------------------------
+    # Board search & feeds
+    # ------------------------------------------------------------------
+    def _parse_board(self, board_data):
+        """Parse a board dict (e.g. from search results) into a clean board."""
+        if not isinstance(board_data, dict):
+            return None
+        board_id = self._val(board_data.get("id"))
+        if not board_id:
+            return None
+        owner = board_data.get("owner", {}) or {}
+        b_url = board_data.get("url")
+        cover = self._val(board_data.get("image_cover_url") or board_data.get("image_cover_hd_url"), True)
+        if not cover:
+            images = board_data.get("images", {})
+            if isinstance(images, dict):
+                for size_key in ["orig", "736x", "474x", "236x"]:
+                    img = images.get(size_key)
+                    if isinstance(img, list) and img:
+                        cover = self._val(img[0].get("url"), True)
+                    elif isinstance(img, dict) and img.get("url"):
+                        cover = self._val(img["url"], True)
+                    if cover:
+                        break
+        return {
+            "id": board_id,
+            "name": self._text(board_data.get("name")),
+            "description": self._text(board_data.get("description")),
+            "url": f"{self.BASE_URL}{b_url}" if b_url else None,
+            "pin_count": board_data.get("pin_count"),
+            "follower_count": board_data.get("follower_count"),
+            "cover_url": cover,
+            "owner": {
+                "id": self._val(owner.get("id")),
+                "username": self._val(owner.get("username")),
+                "full_name": self._val(owner.get("full_name"))
+            }
+        }
+
+    def search_boards(self, query, page_size=25, bookmark=None):
+        """Search for boards instead of pins."""
+        options = {
+            "query": query,
+            "scope": "boards",
+            "page_size": page_size,
+            "bookmarks": [bookmark] if bookmark else []
+        }
+        ok, resource_response = self._api(
+            "BaseSearchResource/get",
+            options,
+            f"/search/boards/?q={query}",
+            "www/[username]/search/boards.js",
+        )
+        if not ok:
+            return {"ok": False, "error": {"message": resource_response}}
+
+        data = resource_response.get("data", {}) if isinstance(resource_response, dict) else {}
+        results = data.get("results", []) if isinstance(data, dict) else []
+        next_bookmark = resource_response.get("bookmark") if isinstance(resource_response, dict) else None
+
+        boards = []
+        for board_data in results:
+            board = self._parse_board(board_data)
+            if board:
+                boards.append(board)
+
+        return self._clean({
+            "ok": True,
+            "query": query,
+            "bookmark": next_bookmark,
+            "boards": boards
+        })
+
+    def _resolve_board_meta(self, url_or_id):
+        """Resolve a board URL or numeric board ID.
+
+        Returns (board_id, board_meta, source_url, error).
+        """
+        if str(url_or_id).isdigit():
+            board_id = str(url_or_id)
+            ok, resource_response = self._api(
+                "BoardResource/get",
+                {"board_id": board_id, "field_set_key": "board"},
+                f"/{board_id}/",
+                "www/[username]/[board_slug].js",
+            )
+            data = resource_response.get("data") if isinstance(resource_response, dict) else None
+            if not ok or not isinstance(data, dict):
+                return None, None, None, "Board not found"
+            b_url = data.get("url") or ""
+            parts = [p for p in b_url.strip("/").split("/") if p]
+            board_meta = {
+                "id": str(data.get("id")) if data.get("id") else board_id,
+                "name": data.get("name"),
+                "url": f"{self.BASE_URL}{b_url}" if b_url else None,
+            }
+            return board_id, board_meta, b_url or f"/{board_id}/", None
+
+        if not isinstance(url_or_id, str) or not (url_or_id.startswith("http://") or url_or_id.startswith("https://")):
+            return None, None, None, "Invalid URL"
+        path_parts = [p for p in urlparse(url_or_id).path.strip("/").split("/") if p]
+        if len(path_parts) < 2:
+            return None, None, None, "Invalid URL"
+        username, board_slug = path_parts[0], path_parts[1]
+
+        user_data, raw_boards, resolved_url, page_error = self._fetch_profile_page(username)
+        for bid, bdata in raw_boards.items():
+            if not isinstance(bdata, dict) or not bdata.get("name"):
+                continue
+            b_url = bdata.get("url") or ""
+            b_slug = _slugify(bdata["name"])
+            if (b_url and b_url.rstrip("/").endswith(f"/{board_slug}")) or b_slug == board_slug.lower() or str(bid) == board_slug:
+                return str(bid), self._format_board_detailed(bid, bdata, username), f"/{username}/{board_slug}/", None
+
+        ok, resource_response = self._api(
+            "BoardResource/get",
+            {"slug": board_slug, "username": username, "field_set_key": "board"},
+            f"/{username}/{board_slug}/",
+            "www/[username]/[board_slug].js",
+        )
+        data = resource_response.get("data") if isinstance(resource_response, dict) else None
+        if not ok or not isinstance(data, dict):
+            return None, None, None, "Board not found"
+        b_url = data.get("url") or f"/{username}/{board_slug}/"
+        board_meta = {
+            "id": str(data.get("id")) if data.get("id") else None,
+            "name": data.get("name"),
+            "url": f"{self.BASE_URL}{b_url}" if data.get("url") else url_or_id,
+        }
+        return board_meta["id"], board_meta, b_url, None
+
+    def get_board_pins(self, url_or_id, page_size=25, bookmark=None):
+        """Retrieve the pins saved to a board (paginated with a bookmark).
+
+        Accepts a board URL (https://www.pinterest.com/username/board-name/)
+        or a numeric board ID.
+        """
+        board_id, board, source_url, error = self._resolve_board_meta(url_or_id)
+        if error:
+            return {"ok": False, "error": {"message": error}}
+
+        ok, resource_response = self._api(
+            "BoardFeedResource/get",
+            {
+                "board_id": board_id,
+                "page_size": page_size,
+                "bookmarks": [bookmark] if bookmark else [],
+            },
+            source_url,
+            "www/[username]/[board_slug].js",
+        )
+        if not ok:
+            return {"ok": False, "error": {"message": resource_response}}
+
+        data = resource_response.get("data", []) if isinstance(resource_response, dict) else []
+        results = data if isinstance(data, list) else []
+        pins = []
+        for pin_data in results:
+            pin_obj = self._parse_pin(pin_data)
+            if pin_obj:
+                pins.append(pin_obj)
+        next_bookmark = resource_response.get("bookmark") if isinstance(resource_response, dict) else None
+
+        return self._clean({
+            "ok": True,
+            "board": board,
+            "bookmark": next_bookmark,
+            "pins": pins
+        })
+
+    def get_user_pins(self, username, page_size=25, bookmark=None):
+        """Retrieve the pins created by a user (paginated with a bookmark)."""
+        username = self._extract_username(username)
+        if not username:
+            return {"ok": False, "error": {"message": "Invalid identifier"}}
+
+        ok, resource_response = self._api(
+            "UserPinsResource/get",
+            {
+                "username": username,
+                "page_size": page_size,
+                "bookmarks": [bookmark] if bookmark else [],
+            },
+            f"/{username}/",
+            "www/[username].js",
+        )
+        if not ok:
+            if "404" in str(resource_response):
+                return {"ok": False, "error": {"message": "User not found"}}
+            return {"ok": False, "error": {"message": resource_response}}
+
+        data = resource_response.get("data", []) if isinstance(resource_response, dict) else []
+        results = data if isinstance(data, list) else []
+        pins = []
+        for pin_data in results:
+            pin_obj = self._parse_pin(pin_data)
+            if pin_obj:
+                pins.append(pin_obj)
+        next_bookmark = resource_response.get("bookmark") if isinstance(resource_response, dict) else None
+
+        return self._clean({
+            "ok": True,
+            "username": username,
+            "bookmark": next_bookmark,
+            "pins": pins
+        })
+
+    # ------------------------------------------------------------------
+    # Media downloads
+    # ------------------------------------------------------------------
+    def _download_file(self, url, dest_dir, filename):
+        try:
+            os.makedirs(dest_dir, exist_ok=True)
+            resp = self.session.get(url, stream=True, timeout=self.timeout, proxies=self.proxies)
+            resp.raise_for_status()
+            filepath = os.path.join(dest_dir, filename)
+            with open(filepath, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=65536):
+                    if chunk:
+                        f.write(chunk)
+            return True, filepath
+        except Exception as e:
+            return False, str(e)
+
+    def download_pin(self, url_or_id, path="."):
+        """Download a pin's media (original image, GIF, or MP4 video) to disk.
+
+        Saves the file as <pin_id>.<ext> inside `path`.
+        """
+        result = self.get_pin(url_or_id)
+        if not result.get("ok"):
+            return result
+        pin = result["pin"]
+
+        media_url = None
+        media_type = pin.get("media_type")
+        if media_type == "video":
+            formats = (pin.get("video") or {}).get("formats") or []
+            mp4s = [f for f in formats if f.get("url", "").lower().endswith(".mp4")]
+            if mp4s:
+                media_url = mp4s[0]["url"]
+            else:
+                media_url = (pin.get("video") or {}).get("poster")
+        else:
+            images = pin.get("images", {})
+            for size_key in ["orig", "736x", "474x", "236x"]:
+                media_url = images.get(size_key, {}).get("url")
+                if media_url:
+                    break
+
+        if not media_url:
+            return {"ok": False, "error": {"message": "No downloadable media for this pin"}}
+
+        ext = os.path.splitext(urlparse(media_url).path)[1]
+        if not ext:
+            ext = ".mp4" if media_type == "video" else ".jpg"
+        filename = f"{pin['id']}{ext}"
+        ok, filepath_or_error = self._download_file(media_url, path, filename)
+        if not ok:
+            return {"ok": False, "error": {"message": filepath_or_error}}
+
+        return {
+            "ok": True,
+            "path": filepath_or_error,
+            "filename": filename,
+            "url": media_url,
+            "media_type": media_type
+        }
+
+    def download_board(self, url_or_id, path=".", limit=None):
+        """Download the media of every pin in a board.
+
+        Iterates all pages of the board feed; `limit` caps the number of
+        pins downloaded.
+        """
+        board_id, board, source_url, error = self._resolve_board_meta(url_or_id)
+        if error:
+            return {"ok": False, "error": {"message": error}}
+
+        downloaded = []
+        failed = []
+        files = []
+        bookmark = None
+        while True:
+            page = self.get_board_pins(board_id, bookmark=bookmark)
+            if not page.get("ok"):
+                break
+            for pin in page.get("pins", []):
+                if limit is not None and len(downloaded) >= limit:
+                    break
+                dl = self.download_pin(pin["id"], path)
+                if dl.get("ok"):
+                    downloaded.append(pin["id"])
+                    files.append(dl.get("path"))
+                else:
+                    failed.append(pin["id"])
+            bookmark = page.get("bookmark")
+            if not bookmark or (limit is not None and len(downloaded) >= limit):
+                break
+
+        return self._clean({
+            "ok": True,
+            "board": board,
+            "downloaded": len(downloaded),
+            "failed": len(failed),
+            "total_pins": len(downloaded) + len(failed),
+            "files": files
         })
 
     # ------------------------------------------------------------------

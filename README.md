@@ -5,11 +5,17 @@ pins, videos, GIFs, profiles, and boards — without an API key.
 
 ## Features
 
-- 🔎 **Search pins** — paginated keyword search with bookmark support
+- 🔎 **Search pins & videos** — paginated keyword search with bookmark support
+  (`search`, `search_all`)
+- 📁 **Search boards** — find boards by keyword (`search_boards`)
 - 📌 **Fetch single pins** — full metadata for images, videos, and GIFs
   (direct MP4 + HLS links, posters, embed data, source attribution)
+- 🗂️ **Board feeds** — list every pin saved to a board (`get_board_pins`)
+- 👤 **User pins** — list every pin created by a user (`get_user_pins`)
 - 👤 **User profiles** — follower/following counts, pin counts, bio, boards
 - 📁 **Boards** — board metadata, cover images, and full board lists per user
+- ⬇️ **Downloads** — save pin media or an entire board to disk
+  (`download_pin`, `download_board`)
 - 🛡️ **Graceful errors** — every method returns a dict with an `ok` flag and a
   descriptive `error.message`; no exceptions are raised by the library itself
 - 🚀 **No API key required** — works with public Pinterest data
@@ -136,7 +142,7 @@ Retrieves all available data for a single pin.
 - Videos include both HLS (`.m3u8`) and direct MP4 links when available
   (`mp4_available` flag).
 
-### `search(query, page_size=25, bookmark=None)`
+### `search(query, page_size=25, bookmark=None, scope="pins")`
 
 Searches for pins and returns a page of results.
 
@@ -144,6 +150,7 @@ Searches for pins and returns a page of results.
 - `page_size` – number of results per page (max 25).
 - `bookmark` – used for pagination; pass the `"bookmark"` value from a
   previous response to get the next page.
+- `scope` – `"pins"` (default) or `"videos"` to restrict the results.
 
 ```python
 {
@@ -204,6 +211,57 @@ Retrieves a user's public profile and their boards.
 }
 ```
 
+### `search_boards(query, page_size=25, bookmark=None)`
+
+Searches for boards instead of pins.
+
+```python
+{
+    "ok": True,
+    "query": "cute cats",
+    "bookmark": "...",
+    "boards": [
+        {
+            "id": "123",
+            "name": "Cute Cats",
+            "description": "...",
+            "url": "https://www.pinterest.com/wagpets/cute-cats/",
+            "pin_count": 1591,
+            "cover_url": "...",
+            "owner": {"id": "...", "username": "wagpets", "full_name": "Wag Pets"}
+        }
+    ]
+}
+```
+
+### `get_board_pins(url_or_id, page_size=25, bookmark=None)`
+
+Retrieves the pins saved to a board, with pagination via `bookmark`.
+
+**Accepts:** a board URL or a numeric board ID.
+
+```python
+{
+    "ok": True,
+    "board": {"id": "...", "name": "...", "url": "..."},
+    "bookmark": "...",          # pass to get the next page
+    "pins": [ ... ]             # each pin has the same structure as get_pin()
+}
+```
+
+### `get_user_pins(username, page_size=25, bookmark=None)`
+
+Retrieves the pins created by a user, with pagination via `bookmark`.
+
+```python
+{
+    "ok": True,
+    "username": "...",
+    "bookmark": "...",
+    "pins": [ ... ]
+}
+```
+
 ### `get_boards(identifier)`
 
 Returns a detailed list of all boards for a user.
@@ -256,6 +314,38 @@ Retrieves a specific board and also returns the user's full board list.
         "owner": {"username": "...", "id": "..."}
     },
     "boards": [ ... ]   # all user boards
+}
+```
+
+### `download_pin(url_or_id, path=".")`
+
+Downloads a pin's media to disk. Images and GIFs are saved at their original
+resolution; videos are saved as the highest-quality MP4 when available
+(falling back to the poster image). Files are named `<pin_id>.<ext>`.
+
+```python
+{
+    "ok": True,
+    "path": "./123456789.jpg",
+    "filename": "123456789.jpg",
+    "url": "https://i.pinimg.com/originals/...",
+    "media_type": "image"
+}
+```
+
+### `download_board(url_or_id, path=".", limit=None)`
+
+Downloads the media of every pin in a board. Walks all pages of the board
+feed; pass `limit` to cap the number of pins downloaded.
+
+```python
+{
+    "ok": True,
+    "board": {"id": "...", "name": "..."},
+    "downloaded": 25,
+    "failed": 0,
+    "total_pins": 25,
+    "files": ["./123.jpg", ...]
 }
 ```
 
