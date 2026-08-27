@@ -125,6 +125,9 @@ class Pinterest:
             resp = self.session.get(url, params=params, headers=headers, timeout=self.timeout, proxies=self.proxies)
             resp.raise_for_status()
             data = resp.json()
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else "?"
+            return False, f"HTTP {status}"
         except Exception as e:
             return False, str(e)
 
@@ -908,13 +911,20 @@ class Pinterest:
         elif re.fullmatch(r"\d+", str(url).strip()):
             pin_id = str(url).strip()
         else:
-            try:
-                resp = self.session.head(url, allow_redirects=True, timeout=self.timeout, proxies=self.proxies)
-                m = re.search(r"/pin/(\d+)", resp.url)
-                if m:
-                    pin_id = m.group(1)
-            except Exception:
-                pass
+            # Resolve short links (pin.it) and other redirects.
+            # Prefer HEAD; fall back to GET when HEAD does not yield a pin path
+            # (some pin.it responses behave differently on HEAD vs GET).
+            for method in ("head", "get"):
+                try:
+                    resp = getattr(self.session, method)(
+                        url, allow_redirects=True, timeout=self.timeout, proxies=self.proxies
+                    )
+                    m = re.search(r"/pin/(\d+)", resp.url)
+                    if m:
+                        pin_id = m.group(1)
+                        break
+                except Exception:
+                    continue
         if not pin_id:
             return {"ok": False, "error": {"message": "Cannot extract pin ID from URL"}}
 
